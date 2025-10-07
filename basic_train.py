@@ -167,6 +167,7 @@ for epoch in range(config.EPOCHS):
                        "train_loss": loss_,
                        "train_accuracy": acc_,
                        "learning_rate": scheduler_final.get_last_lr()[0],
+                       "batch_time": batch_time,
                        })
 
     torch.save(model.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-{step}.pth"))
