@@ -1,3 +1,4 @@
+import os
 from time import time
 
 import numpy as np
@@ -7,6 +8,9 @@ from torch.utils.data import DataLoader
 from torchvision.models import vit_b_16
 from torchvision.datasets import ImageFolder
 import torchvision.transforms as transforms
+
+import torchmetrics
+import wandb
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -21,6 +25,36 @@ N_CLASSES = 19168
 
 dst_path = "/media/disk/vista/BBDD_video_image/ImageNet21kOfficial/winter21_whole"
 
+config = {
+        "RESIZE": 256,
+        "CENTER_CROP": 224,
+        "PROB_HOR_FLIP": 0.5,
+        "RANDAUGMENT_OPS": 2,
+        "RANDAUGMENT_MAG": 10,
+        "BATCH_SIZE": 512,
+        "LEARNING_RATE": 1e-3,
+        "BETA1": 0.9,
+        "BETA2": 0.999,
+        "WEIGHT_DECAY": 0.03,
+        "DECOUPLED_WEIGHT_DECAY": True,
+        "EPOCHS": 1,
+        "LINEAR_STEPS": 10000,
+        "START_FACTOR": 1/10,
+        "END_FACTOR": 1.,
+        }
+
+wandb.init(
+        project="vit-21k",
+        name="vit-b-16",
+        job_type="training",
+        config=config,
+        mode="online",
+        )
+config = wandb.config
+
+## Metric definition
+loss_metric = torchmetrics.aggregation.MeanMetric().to(device)
+acc_metric = torchmetrics.classification.Accuracy(task="multiclass", num_classes=N_CLASSES).to(device)
 
 model = vit_b_16(weights=None, num_classes=N_CLASSES)
 model.to(device)
@@ -36,16 +70,17 @@ def get_n_params(model):
         pp += nn
     return pp
 
-print(f"Total Params: {get_n_params(model)}")
+n_params = get_n_params(model)
+wandb.run.summary.update({"total_parameters": n_params})
+print(f"Total Params: {n_params}")
 
 train_transforms = transforms.Compose([
     ## Preprocessing
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
+    transforms.Resize(config.RESIZE),
+    transforms.CenterCrop(config.CENTER_CROP),
     ## Augmentations
-    transforms.RandomHorizontalFlip(0.5),
-    transforms.RandAugment(num_ops=2, magnitude=10),
-
+    transforms.RandomHorizontalFlip(config.PROB_HOR_FLIP),
+    transforms.RandAugment(num_ops=config.RANDAUGMENT_OPS, magnitude=config.RANDAUGMENT_MAG), 
     ## Preprocessing
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -64,14 +99,14 @@ dst = ImageFolder(dst_path,
                   transform=train_transforms)
 print(f"Dataset length: {len(dst)}")
 
-BATCH_SIZE = 512
 
 dst_rdy = DataLoader(dst,
-                     batch_size=BATCH_SIZE,
+                     batch_size=config.BATCH_SIZE,
                      shuffle=True,
                      num_workers=16,
                      pin_memory=True)
 N_BATCHES = len(dst_rdy)
+wandb.run.summary.update({"N_BATCHES": N_BATCHES})
 print(f"DataLoader length: {N_BATCHES}")
 
 for batch in dst_rdy:
@@ -80,26 +115,24 @@ x, y = batch
 print(f"X: {x.shape} Y: {y.shape}")
 
 loss_fn = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=0.03, decoupled_weight_decay=True)
+optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, betas=(config.BETA1, config.BETA2), weight_decay=config.WEIGHT_DECAY, decoupled_weight_decay=config.DECOUPLED_WEIGHT_DECAY)
 
 ## Schedulers
-EPOCHS = 1
-LINEAR_STEPS = 10000
 scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, 
-                                               start_factor=1/10,
-                                               end_factor=1.,
-                                               total_iters=LINEAR_STEPS)
+                                               start_factor=config.START_FACTOR,
+                                               end_factor=config.END_FACTOR,
+                                               total_iters=config.LINEAR_STEPS)
 scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                        T_max=N_BATCHES*EPOCHS-LINEAR_STEPS)
+                                                        T_max=N_BATCHES*config.EPOCHS-config.LINEAR_STEPS)
 scheduler_final = torch.optim.lr_scheduler.SequentialLR(optimizer,
                                                         schedulers=[scheduler1, scheduler2],
-                                                        milestones=[LINEAR_STEPS])
+                                                        milestones=[config.LINEAR_STEPS])
 
 ## Training Loop
 model.train()
-epochs_loss = []
+epochs_loss, epochs_acc = [], []
 step = 0
-for epoch in range(EPOCHS):
+for epoch in range(config.EPOCHS):
     batch_loss = []
     for batch in dst_rdy:
         batch_start = time()
@@ -117,14 +150,34 @@ for epoch in range(EPOCHS):
         torch.nn.utils.clip_grad_norm(model.parameters(), max_norm=1.)
 
         optimizer.step()
-        batch_loss.append(loss.item())
+        # batch_loss.append(loss.item())
+
+        ## Metric
+        loss_metric.update(loss)
+        acc = acc_metric(pred, y)
         step += 1
 
         scheduler_final.step()
         batch_end = time()
         if step % 100 == 0 or step == 1:
-            print(f"Step {step} ({batch_end-batch_start:.3f}s/batch) --> Loss: {np.mean(batch_loss).item()}")
+            batch_time = batch_end-batch_start
+            loss_, acc_ = loss_metric.compute(), acc_metric.compute()
+            print(f"Step {step} ({batch_time:.3f}s/batch) --> Loss: {loss_} | Acc: {acc_}")
+            wandb.log({"step": step,
+                       "train_loss": loss_,
+                       "train_accuracy": acc_,
+                       "learning_rate": scheduler_final.get_last_lr()[0],
+                       })
 
-    torch.save(model.state_dict(), f"vit-im21k-{step}.pth")
-    epochs_loss.append(np.mean(batch_loss).item())
+    torch.save(model.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-{step}.pth"))
+    torch.save(optimizer.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-optimizer-{step}.pth"))
+    torch.save(scheduler_final.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-scheduler-{step}.pth"))
+    epochs_loss.append(loss_metric.compute())
+    epochs_acc.append(acc_metric.compute())
+
+    ## Reset metrics
+    loss_metric.reset()
+    acc_metric.reset()
     # break
+
+wandb.finish()
