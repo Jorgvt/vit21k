@@ -31,13 +31,14 @@ config = {
         "PROB_HOR_FLIP": 0.5,
         "RANDAUGMENT_OPS": 2,
         "RANDAUGMENT_MAG": 10,
+        "TEST_SIZE": 0.2,
         "BATCH_SIZE": 512,
         "LEARNING_RATE": 1e-3,
         "BETA1": 0.9,
         "BETA2": 0.999,
         "WEIGHT_DECAY": 0.03,
         "DECOUPLED_WEIGHT_DECAY": True,
-        "EPOCHS": 1,
+        "EPOCHS": 7,
         "LINEAR_STEPS": 10000,
         "START_FACTOR": 1/10,
         "END_FACTOR": 1.,
@@ -53,8 +54,11 @@ wandb.init(
 config = wandb.config
 
 ## Metric definition
-loss_metric = torchmetrics.aggregation.MeanMetric().to(device)
-acc_metric = torchmetrics.classification.Accuracy(task="multiclass", num_classes=N_CLASSES).to(device)
+loss_metric_train = torchmetrics.aggregation.MeanMetric().to(device)
+acc_metric_train = torchmetrics.classification.Accuracy(task="multiclass", num_classes=N_CLASSES).to(device)
+
+loss_metric_val = torchmetrics.aggregation.MeanMetric().to(device)
+acc_metric_val = torchmetrics.classification.Accuracy(task="multiclass", num_classes=N_CLASSES).to(device)
 
 model = vit_b_16(weights=None, num_classes=N_CLASSES)
 model.to(device)
@@ -97,19 +101,27 @@ train_transforms = transforms.Compose([
 
 dst = ImageFolder(dst_path,
                   transform=train_transforms)
+TRAIN_SIZE = 1 - config.TEST_SIZE
+dst_train, dst_val = torch.utils.data.random_split(dst, lengths=[TRAIN_SIZE, config.TEST_SIZE], generator=torch.Generator().manual_seed(42))
 print(f"Dataset length: {len(dst)}")
+print(f"Dataset (Train) length: {len(dst_train)}")
+print(f"Dataset (Validation) length: {len(dst_val)}")
 
 
-dst_rdy = DataLoader(dst,
+dst_train_rdy = DataLoader(dst_train,
                      batch_size=config.BATCH_SIZE,
                      shuffle=True,
                      num_workers=16,
                      pin_memory=True)
-N_BATCHES = len(dst_rdy)
+dst_val_rdy = DataLoader(dst_val,
+                     batch_size=config.BATCH_SIZE,
+                     num_workers=16,
+                     pin_memory=True)
+N_BATCHES = len(dst_train_rdy)
 wandb.run.summary.update({"N_BATCHES": N_BATCHES})
 print(f"DataLoader length: {N_BATCHES}")
 
-for batch in dst_rdy:
+for batch in dst_train_rdy:
     break
 x, y = batch
 print(f"X: {x.shape} Y: {y.shape}")
@@ -134,7 +146,8 @@ epochs_loss, epochs_acc = [], []
 step = 0
 for epoch in range(config.EPOCHS):
     batch_loss = []
-    for batch in dst_rdy:
+    ## Train
+    for batch in dst_train_rdy:
         batch_start = time()
         optimizer.zero_grad()
 
@@ -153,19 +166,42 @@ for epoch in range(config.EPOCHS):
         # batch_loss.append(loss.item())
 
         ## Metric
-        loss_metric.update(loss)
-        acc = acc_metric(pred, y)
+        loss_metric_train.update(loss)
+        acc = acc_metric_train(pred, y)
         step += 1
 
         scheduler_final.step()
         batch_end = time()
         if step % 100 == 0 or step == 1:
             batch_time = batch_end-batch_start
-            loss_, acc_ = loss_metric.compute(), acc_metric.compute()
-            print(f"Step {step} ({batch_time:.3f}s/batch) --> Loss: {loss_} | Acc: {acc_}")
+            loss_, acc_ = loss_metric_train.compute(), acc_metric_train.compute()
+
+            ## Validation
+            ### Enter evaluation mode
+            model.eval()
+            with torch.inference_mode():
+                for batch in dst_val_rdy:
+                    x, y = batch
+                    x, y = x.to(device), y.to(device)
+
+                    pred = model(x)
+                    loss = loss_fn(pred, y)
+
+                    ## Calculate and accumulate metrics
+                    loss_metric_val.update(loss)
+                    acc = acc_metric_val(pred, y)
+                    # break
+
+            loss_val, acc_val = loss_metric_val.compute(), acc_metric_val.compute()
+
+            ### Go back to training mode
+            model.train()
+            print(f"Step {step} ({batch_time:.3f}s/batch) --> [Train] Loss: {loss_} | Acc: {acc_} [Val] Loss: {loss_val} | Acc: {acc_val}")
             wandb.log({"step": step,
                        "train_loss": loss_,
                        "train_accuracy": acc_,
+                       "val_loss": loss_val,
+                       "val_accuracy": acc_val,
                        "learning_rate": scheduler_final.get_last_lr()[0],
                        "batch_time": batch_time,
                        })
@@ -173,12 +209,14 @@ for epoch in range(config.EPOCHS):
     torch.save(model.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-{step}.pth"))
     torch.save(optimizer.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-optimizer-{step}.pth"))
     torch.save(scheduler_final.state_dict(), os.path.join(wandb.run.dir, f"vit-im21k-scheduler-{step}.pth"))
-    epochs_loss.append(loss_metric.compute())
-    epochs_acc.append(acc_metric.compute())
+    epochs_loss.append(loss_metric_train.compute())
+    epochs_acc.append(acc_metric_train.compute())
 
     ## Reset metrics
-    loss_metric.reset()
-    acc_metric.reset()
+    loss_metric_train.reset()
+    acc_metric_train.reset()
+    loss_metric_val.reset()
+    acc_metric_val.reset()
     # break
 
 wandb.finish()
